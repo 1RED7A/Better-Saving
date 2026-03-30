@@ -1,0 +1,118 @@
+{
+    "geode": "5.4.1",
+    "gd": {
+        "win": "2.2081",
+        "android": "2.2081"
+    },
+    "id": "1red7a.bettersaving",
+    "name": "Better Saving",
+    "version": "v1.0.0",
+    "developer": "1RED7A",
+    "description": "Automatically saves your game data at a regular interval with rolling backups and restore tools. Manual Saving also exists.",
+    "dependencies": {
+        "geode.node-ids": ">=v1.23.3"
+    },
+    "settings": {
+        "enabled": {
+            "name": "Enable",
+            "description": "Turns the entire mod on or off.",
+            "type": "bool",
+            "default": true
+        },
+        "auto-save-enabled": {
+            "name": "Auto Save",
+            "description": "Save automatically on a timed interval. Disable to rely only on manual saves or level complete.",
+            "type": "bool",
+            "default": false,
+            "enable-if": "enabled"
+        },
+        "last-save-display": {
+            "type": "custom:last-save-display",
+            "name": "Last Saved",
+            "description": "Shows when the last successful save happened.",
+            "enable-if": "enabled"
+        },
+        "save-interval": {
+            "name": "Save Interval (minutes)",
+            "description": "How often the auto save timer fires.",
+            "type": "int",
+            "default": 15,
+            "min": 1,
+            "max": 60,
+            "enable-if": "enabled"
+        },
+        "save-cooldown": {
+            "name": "Save Cooldown (seconds)",
+            "description": "Minimum time between saves. Prevents saving too frequently. Recommended not to touch this value.",
+            "type": "int",
+            "default": 30,
+            "min": 5,
+            "max": 600,
+            "enable-if": "enabled"
+        },
+        "defer-behavior": {
+            "name": "Deferred Save Behavior",
+            "description": "What happens when a save is triggered while you are inside a level.",
+            "type": "string",
+            "default": "silent",
+            "enum": ["silent", "toast-on-menu", "hud-icon"],
+            "enable-if": "enabled"
+        },
+        "pending-save-timeout": {
+            "name": "Deferred Save Timeout (minutes)",
+            "description": "How long to keep a deferred save waiting before discarding it.",
+            "type": "int",
+            "default": 10,
+            "min": 1,
+            "max": 60,
+            "enable-if": "enabled"
+        },
+        "save-on-complete": {
+            "name": "Save on Level Complete",
+            "description": "Save automatically when you complete a level.",
+            "type": "bool",
+            "default": true,
+            "enable-if": "enabled"
+        },
+        "save-in-editor": {
+            "name": "Save in Editor",
+            "description": "Allow saving while in the level editor. May cause a brief freeze.",
+            "type": "bool",
+            "default": false,
+            "enable-if": "enabled"
+        },
+        "enable-backups": {
+            "name": "Enable Backups",
+            "description": "Create a rolling backup after each save and a safe-exit backup when quitting cleanly.",
+            "type": "bool",
+            "default": true,
+            "enable-if": "enabled"
+        },
+        "show-notification": {
+            "name": "Show Save Notification",
+            "description": "Show a small popup when the game saves.",
+            "type": "bool",
+            "default": true,
+            "enable-if": "enabled"
+        },
+        "verbose-logging": {
+            "name": "Verbose Logging",
+            "description": "Write detailed save events to the Geode log. Useful for debugging.",
+            "type": "bool",
+            "default": false,
+            "enable-if": "enabled"
+        },
+        "force-save": {
+            "type": "custom:force-save-button",
+            "name": "Force Save Now",
+            "description": "Save immediately, bypassing the cooldown.",
+            "enable-if": "enabled"
+        },
+        "backup-manager": {
+            "type": "custom:backup-manager",
+            "name": "Manage Backups",
+            "description": "View, restore, or delete your save backups.",
+            "enable-if": "enabled"
+        }
+    }
+}
