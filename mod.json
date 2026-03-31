@@ -3,11 +3,12 @@
     "gd": {
         "win": "2.2081",
         "android": "2.2081",
-        "android32": "2.2081"
+        "android32": "2.2081",
+        "ios": "2.2081"
     },
     "id": "1red7a.bettersaving",
     "name": "Better Saving",
-    "version": "v1.0.0",
+    "version": "v1.1.0",
     "developer": "1RED7A",
     "description": "Automatically saves your game data at a regular interval with rolling backups and restore tools. Manual Saving also exists.",
     "dependencies": {
