@@ -58,8 +58,6 @@ Big thanks to my friend **Gkio** for helping during playtesting.
 
 ## Additional Informations
 
-Support for iOS, macOS, and Linux is in the works. If the mod gains attention, development may move faster ;)  
-
 If you have any issues, suggestions, or just want to reach out:  
 - *Discord:* reds8086  
 - *GitHub:* [https://github.com/1RED7A]  
