@@ -7,7 +7,7 @@ Reliable manual, autosave and backups for Geometry Dash.
 - Manual save and Autosave on a timer
 - Save when completing a level
 - Android exit button that saves before closing
-- Rolling backups and onetap restore
+- Rolling backups and one tab restore
 - More
 
 ## Installation
