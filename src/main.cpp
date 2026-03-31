@@ -1,3 +1,4 @@
+
 #include <Geode/Geode.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/GameManager.hpp>
@@ -17,8 +18,6 @@
 
 using namespace geode::prelude;
 
-// ── Forward declarations ───────────────────────────────────────────────────────
-
 void runSaveLogic(bool force = false);
 void doRollingBackup();
 void doSafeExitBackup();
@@ -29,8 +28,6 @@ static std::atomic<bool> s_saving{false};
 struct SavingGuard {
     ~SavingGuard() { s_saving = false; }
 };
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
 
 static std::string fmtFileTime(const std::filesystem::file_time_type& ft) {
     std::time_t t = 0;
@@ -43,7 +40,6 @@ static std::string fmtFileTime(const std::filesystem::file_time_type& ft) {
         return "Unknown Time";
     }
 
-    // Negative time crashes localtime_s on Windows
     if (t <= 0) return "Unknown Time";
 
     std::tm tm{};
@@ -82,7 +78,6 @@ static std::string fmtLastSaveTime(int64_t timestamp) {
     return std::string(buf);
 }
 
-// ── ManageBackupsPopup ─────────────────────────────────────────────────────────
 // Shows the 2 backup slots with Restore and Delete actions.
 
 class ManageBackupsPopup : public geode::Popup {
@@ -262,8 +257,7 @@ protected:
             [this, name](auto*, bool ok) {
                 if (!ok) return;
                 std::error_code ec;
-                // Delete from the mod save folder, same place backups are written
-                std::filesystem::remove(Mod::get()->getSaveDir() / name, ec);
+            std::filesystem::remove(Mod::get()->getSaveDir() / name, ec);
                 if (ec) {
                     Notification::create("Delete failed!", NotificationIcon::Error)->show();
                     log::warn("[Better Saving] Delete failed for {}: {}", name, ec.message());
@@ -286,8 +280,6 @@ public:
         return nullptr;
     }
 };
-
-// ── ForceSaveSettingV3 ─────────────────────────────────────────────────────────
 
 class ForceSaveSettingV3 : public SettingV3 {
 public:
@@ -363,8 +355,6 @@ SettingNodeV3* ForceSaveSettingV3::createNode(float width) {
         std::static_pointer_cast<ForceSaveSettingV3>(shared_from_this()), width
     );
 }
-
-// ── BackupManagerSettingV3 ─────────────────────────────────────────────────────
 
 class BackupManagerSettingV3 : public SettingV3 {
 public:
@@ -443,7 +433,6 @@ SettingNodeV3* BackupManagerSettingV3::createNode(float width) {
     );
 }
 
-// ── LastSaveDisplaySettingV3 ───────────────────────────────────────────────────
 // Shows "Last saved: HH:MM" in the settings panel, updates every second.
 
 class LastSaveDisplaySettingV3 : public SettingV3 {
@@ -519,7 +508,6 @@ SettingNodeV3* LastSaveDisplaySettingV3::createNode(float width) {
     );
 }
 
-// ── AutoSaveManager ────────────────────────────────────────────────────────────
 // Singleton CCNode that owns the scheduler and all save state.
 
 class AutoSaveManager : public CCNode {
@@ -573,7 +561,7 @@ public:
     void scheduleTimer() {
         if (m_timerRunning) {
             if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-                log::info("[Better Saving] Timer already running — skipping reschedule.");
+                log::info("[Better Saving] Timer already running â€” skipping reschedule.");
             return;
         }
 
@@ -611,7 +599,7 @@ public:
 
             if (ageMins > Mod::get()->getSettingValue<int64_t>("pending-save-timeout")) {
                 m_pendingSave = false;
-                log::warn("[Better Saving] Pending save expired after {} minutes — discarded.", (int)ageMins);
+                log::warn("[Better Saving] Pending save expired after {} minutes â€” discarded.", (int)ageMins);
                 removePendingIcon();
                 return;
             }
@@ -660,10 +648,6 @@ public:
     }
 };
 
-// ── File operations ────────────────────────────────────────────────────────────
-
-// Waits until the source file can be opened for reading.
-// Handles the "ghost data" bug — protects against copying while GD is still writing.
 static bool waitForFileReady(const std::filesystem::path& p, int maxRetries = 5) {
     for (int i = 0; i < maxRetries; ++i) {
         std::ifstream f(p, std::ios::binary);
@@ -678,18 +662,15 @@ bool atomicCopy(
     const std::filesystem::path& dst,
     std::error_code& ec
 ) {
-    // Unique temp name prevents collisions if saves somehow overlap
     auto tmp = dst.string() + ".tmp." +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
 
-    // Wait until source file is not locked (ghost data fix)
     if (!waitForFileReady(src)) {
         ec = std::make_error_code(std::errc::resource_unavailable_try_again);
         log::warn("[Better Saving] Source file locked after retries: {}", src.string());
         return false;
     }
 
-    // Copy to temp, with retry for antivirus/lock races
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
         if (!ec) break;
@@ -697,16 +678,12 @@ bool atomicCopy(
     }
     if (ec) return false;
 
-    // "No-gap" swap: rename dst to .old first, then move tmp into place.
-    // If we crash between these two renames, .old still exists — no backup is lost.
     auto old = dst.string() + ".old";
     if (std::filesystem::exists(dst, ec)) {
         std::filesystem::rename(dst, old, ec);
-        // If we can't move the old file out of the way, just remove it
         if (ec) std::filesystem::remove(dst, ec);
     }
 
-    // Rename temp to final destination, with retry
     ec = {};
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::filesystem::rename(tmp, dst, ec);
@@ -714,7 +691,6 @@ bool atomicCopy(
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // Clean up the .old file — safe to ignore errors here
     std::error_code cleanEc;
     std::filesystem::remove(old, cleanEc);
 
@@ -725,12 +701,9 @@ void doRollingBackup() {
     if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
 
     std::error_code ec;
-    
-    // SOURCE: Actual GD Folder (One level up from Geode)
-    auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
-    // DESTINATION: Your Mod's folder
+    auto mainFile = geode::dirs::getSaveDir() / "CCGameManager.dat";
     auto modDir = Mod::get()->getSaveDir();
-    std::filesystem::create_directories(modDir, ec); 
+    std::filesystem::create_directories(modDir, ec);
     auto b0 = modDir / "Save_Backup.bak";
 
     if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
@@ -778,8 +751,7 @@ void doSafeExitBackup() {
 bool restoreFromBackup(const std::string& backupName) {
     std::error_code ec;
     auto backupFile = Mod::get()->getSaveDir() / backupName;
-    // DESTINATION: The real GD save folder
-    auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
+auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
 
     if (!std::filesystem::exists(backupFile, ec)) {
         Notification::create("Backup not found!", NotificationIcon::Error)->show();
@@ -803,7 +775,7 @@ bool restoreFromBackup(const std::string& backupName) {
 }
 
 void runSaveLogic(bool force) {
-    auto  now     = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
     auto* manager = AutoSaveManager::get();
 
     auto cooldownSecs = Mod::get()->getSettingValue<int64_t>("save-cooldown");
@@ -813,11 +785,10 @@ void runSaveLogic(bool force) {
 
     if (!force && elapsed < cooldownSecs) {
         if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[Better Saving] Save skipped — cooldown ({}/{}s).",
+            log::info("[Better Saving] Save skipped â€” cooldown ({}/{}s).",
                 (long long)elapsed, (long long)cooldownSecs);
 
-        // Only show "already saved" when the player explicitly pressed the button
-        if (Mod::get()->getSettingValue<bool>("show-notification")) {
+if (Mod::get()->getSettingValue<bool>("show-notification")) {
             auto last = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
             if (last > 0) {
                 std::ostringstream ss;
@@ -854,16 +825,13 @@ void runSaveLogic(bool force) {
         "last-save-time",
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
     );
-    // Force settings to disk now — don't wait for the game to close
-    Mod::get()->saveData();
+Mod::get()->saveData();
 
     if (Mod::get()->getSettingValue<bool>("verbose-logging"))
         log::info("[Better Saving] Save executed successfully.");
     if (Mod::get()->getSettingValue<bool>("show-notification"))
         Notification::create("Game saved!", NotificationIcon::Success)->show();
 }
-
-// ── $execute ───────────────────────────────────────────────────────────────────
 
 $execute {
     (void)Mod::get()->registerCustomSettingType("force-save-button", &ForceSaveSettingV3::parse);
@@ -896,16 +864,13 @@ $execute {
     });
 }
 
-
-// ── PlayLayer hook ─────────────────────────────────────────────────────────────
-
 class $modify(MyPlayLayer, PlayLayer) {
     void levelComplete() {
         PlayLayer::levelComplete();
 
         if (this->m_isPracticeMode) {
             if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-                log::info("[Better Saving] Practice mode — skipping save.");
+                log::info("[Better Saving] Practice mode â€” skipping save.");
             return;
         }
 
@@ -931,8 +896,6 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 };
 
-// ── MenuLayer hook ─────────────────────────────────────────────────────────────
-
 class $modify(MyMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
@@ -953,8 +916,7 @@ class $modify(MyMenuLayer, MenuLayer) {
             manager->removePendingIcon();
         }
 
-#ifdef GEODE_IS_ANDROID
-        // Save-and-exit button — top-left corner, Android only (no native quit button exists)
+#if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
         auto winSize = CCDirector::get()->getWinSize();
 
         auto* exitSpr = ButtonSprite::create(
@@ -964,7 +926,7 @@ class $modify(MyMenuLayer, MenuLayer) {
 
         auto* exitBtn = CCMenuItemSpriteExtra::create(
             exitSpr, this,
-            menu_selector(MyMenuLayer::onAndroidExit)
+            menu_selector(MyMenuLayer::onMobileExit)
         );
 
         auto* exitMenu = CCMenu::create();
@@ -976,8 +938,8 @@ class $modify(MyMenuLayer, MenuLayer) {
         return true;
     }
 
-#ifdef GEODE_IS_ANDROID
-    void onAndroidExit(CCObject*) {
+#if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
+    void onMobileExit(CCObject*) {
         createQuickPopup(
             "Exit Game",
             "<cy>This button saves and exits the game.</c>",
@@ -985,10 +947,7 @@ class $modify(MyMenuLayer, MenuLayer) {
             [](auto*, bool ok) {
                 if (!ok) return;
                 doSafeExitBackup();
-                // gm->save() inside runSaveLogic is synchronous — it blocks until
-                // the file is written. Safe to call end() immediately after.
                 runSaveLogic(true);
-                // Flush mod settings to disk before exit
                 Mod::get()->saveData();
                 CCDirector::get()->end();
             }
@@ -1001,6 +960,5 @@ class $modify(MyMenuLayer, MenuLayer) {
         MenuLayer::onQuit(sender);
     }
 };
-
 
 //end :)
