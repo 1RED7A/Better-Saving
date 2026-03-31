@@ -1,10 +1,10 @@
 # Better-Saving
-Reliable autosaves and backups for Geometry Dash.
+Reliable manual, auto-saves and backups for Geometry Dash.
 
 <img src="logo.png" width="150" alt="Better Saving logo" />
 
 ## Features
-- Manual save and Autosave on a timer
+- Manual save and Auto-save on a timer
 - Save when completing a level
 - Android exit button that saves before closing
 - Rolling backups and onetap restore
