@@ -3,7 +3,6 @@
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/GameManager.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/AppDelegate.hpp>
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/loader/Dirs.hpp>
@@ -19,20 +18,10 @@
 
 using namespace geode::prelude;
 
-// button layout for the backup popup
-constexpr float kRestoreBtnX  = 235.f;
-constexpr float kDeleteBtnX   = 304.f;
-constexpr float kEntryStepY   = 75.f;
-constexpr float kRowLabelX    = 12.f;
-constexpr float kInfoOffsetY  = 20.f;
-constexpr float kBtnOffsetY   = 8.f;
-// wait for level complete animation + results transition before saving
-constexpr float kLevelSaveDelay = 5.0f;
-
 void runSaveLogic(bool force = false);
-void createBackup(const std::string& slot);
+void doRollingBackup();
+void doSafeExitBackup();
 bool restoreFromBackup(const std::string& backupName);
-static void focusLostSave();
 
 static std::atomic<bool> s_saving{false};
 
@@ -50,6 +39,7 @@ static std::string fmtFileTime(const std::filesystem::file_time_type& ft) {
     } catch (...) {
         return "Unknown Time";
     }
+
     if (t <= 0) return "Unknown Time";
 
     std::tm tm{};
@@ -58,6 +48,7 @@ static std::string fmtFileTime(const std::filesystem::file_time_type& ft) {
 #else
     if (!localtime_r(&t, &tm)) return "Unknown Time";
 #endif
+
     char buf[64];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
     return std::string(buf);
@@ -73,9 +64,9 @@ static std::string humanSize(uint64_t bytes) {
     char b[32]; std::snprintf(b, sizeof(b), "%.1f MB", mb); return b;
 }
 
-static std::string fmtLastSaveTime(int64_t ts) {
-    if (ts <= 0) return "Never";
-    std::time_t t = static_cast<std::time_t>(ts);
+static std::string fmtLastSaveTime(int64_t timestamp) {
+    if (timestamp <= 0) return "Never";
+    std::time_t t = static_cast<std::time_t>(timestamp);
     std::tm tm{};
 #ifdef _WIN32
     localtime_s(&tm, &t);
@@ -87,11 +78,15 @@ static std::string fmtLastSaveTime(int64_t ts) {
     return std::string(buf);
 }
 
-// shows the two backup slots with restore + delete per entry
-class ManageBackupsPopup : public geode::Popup<> {
+// Shows the 2 backup slots with Restore and Delete actions.
+
+class ManageBackupsPopup : public geode::Popup {
 protected:
     struct BackupEntry {
-        std::string name, displayName, timeStr, sizeStr;
+        std::string name;
+        std::string displayName;
+        std::string timeStr;
+        std::string sizeStr;
         bool exists = false;
     };
 
@@ -107,19 +102,21 @@ protected:
         return true;
     }
 
-    void setup() override {}
-
-    void checkUpdates(float) {
-        auto old = m_entries;
+    void checkUpdates(float dt) {
+        auto oldEntries = m_entries;
         loadEntries();
+
+        bool changed = false;
         for (size_t i = 0; i < m_entries.size(); i++) {
-            if (m_entries[i].exists  != old[i].exists  ||
-                m_entries[i].timeStr != old[i].timeStr ||
-                m_entries[i].sizeStr != old[i].sizeStr) {
-                buildUI();
-                return;
+            if (m_entries[i].exists  != oldEntries[i].exists  ||
+                m_entries[i].timeStr != oldEntries[i].timeStr ||
+                m_entries[i].sizeStr != oldEntries[i].sizeStr) {
+                changed = true;
+                break;
             }
         }
+
+        if (changed) buildUI();
     }
 
     void loadEntries() {
@@ -127,11 +124,12 @@ protected:
         std::error_code ec;
         auto dir = Mod::get()->getSaveDir();
 
-        auto push = [&](const std::string& name, const std::string& display) {
+        auto makeEntry = [&](const std::string& name, const std::string& displayName) {
             BackupEntry e;
-            e.name = name; e.displayName = display;
-            auto p = dir / name;
-            e.exists = std::filesystem::exists(p, ec);
+            e.name        = name;
+            e.displayName = displayName;
+            auto p        = dir / name;
+            e.exists      = std::filesystem::exists(p, ec);
             if (e.exists) {
                 e.timeStr = fmtFileTime(std::filesystem::last_write_time(p, ec));
                 e.sizeStr = humanSize(std::filesystem::file_size(p, ec));
@@ -139,30 +137,31 @@ protected:
             m_entries.push_back(e);
         };
 
-        push("Save_Backup.bak",           "Regular Backup");
-        push("Last_Safe_Save_Backup.bak", "Safe Exit Backup");
+        makeEntry("Save_Backup.bak",           "Regular Backup");
+        makeEntry("Last_Safe_Save_Backup.bak", "Safe Exit Backup");
     }
 
     void buildUI() {
         if (m_container) m_container->removeFromParent();
+
         m_container = CCNode::create();
         m_mainLayer->addChild(m_container);
 
         float y = 175.f;
+
         for (auto& e : m_entries) {
             auto* nameLabel = CCLabelBMFont::create(e.displayName.c_str(), "bigFont.fnt");
             nameLabel->setScale(0.45f);
             nameLabel->setAnchorPoint({0.f, 0.5f});
-            nameLabel->setPosition({kRowLabelX, y});
+            nameLabel->setPosition({12.f, y});
             m_container->addChild(nameLabel);
 
             if (e.exists) {
-                auto* infoLbl = CCLabelBMFont::create(
-                    (e.timeStr + "   " + e.sizeStr).c_str(), "chatFont.fnt"
-                );
+                auto info     = e.timeStr + "   " + e.sizeStr;
+                auto* infoLbl = CCLabelBMFont::create(info.c_str(), "chatFont.fnt");
                 infoLbl->setScale(0.55f);
                 infoLbl->setAnchorPoint({0.f, 0.5f});
-                infoLbl->setPosition({kRowLabelX, y - kInfoOffsetY});
+                infoLbl->setPosition({12.f, y - 20.f});
                 infoLbl->setColor({170, 170, 170});
                 m_container->addChild(infoLbl);
 
@@ -170,54 +169,77 @@ protected:
                 menu->setPosition({0.f, 0.f});
                 m_container->addChild(menu);
 
-                // helper so we don't repeat the button setup twice
-                auto mkBtn = [&](const char* lbl, const char* spr, float x, SEL_MenuHandler sel) {
-                    auto* sp  = ButtonSprite::create(lbl, "bigFont.fnt", spr, 0.7f);
-                    sp->setScale(0.55f);
-                    auto* btn = CCMenuItemSpriteExtra::create(sp, this, sel);
-                    btn->setUserObject(CCString::create(e.name));
-                    btn->setPosition({x, y - kBtnOffsetY});
-                    menu->addChild(btn);
-                };
+                auto* restoreSpr = ButtonSprite::create(
+                    "Restore", "bigFont.fnt", "GJ_button_01.png", 0.7f
+                );
+                restoreSpr->setScale(0.55f);
+                auto* restoreBtn = CCMenuItemSpriteExtra::create(
+                    restoreSpr, this,
+                    menu_selector(ManageBackupsPopup::onRestore)
+                );
+                restoreBtn->setUserObject(CCString::create(e.name));
+                restoreBtn->setPosition({235.f, y - 8.f});
+                menu->addChild(restoreBtn);
 
-                mkBtn("Restore", "GJ_button_01.png", kRestoreBtnX, menu_selector(ManageBackupsPopup::onRestore));
-                mkBtn("Delete",  "GJ_button_06.png", kDeleteBtnX,  menu_selector(ManageBackupsPopup::onDelete));
+                auto* deleteSpr = ButtonSprite::create(
+                    "Delete", "bigFont.fnt", "GJ_button_06.png", 0.7f
+                );
+                deleteSpr->setScale(0.55f);
+                auto* deleteBtn = CCMenuItemSpriteExtra::create(
+                    deleteSpr, this,
+                    menu_selector(ManageBackupsPopup::onDelete)
+                );
+                deleteBtn->setUserObject(CCString::create(e.name));
+                deleteBtn->setPosition({304.f, y - 8.f});
+                menu->addChild(deleteBtn);
+
             } else {
                 auto* noneLbl = CCLabelBMFont::create("No backup file found", "chatFont.fnt");
                 noneLbl->setScale(0.5f);
                 noneLbl->setAnchorPoint({0.f, 0.5f});
-                noneLbl->setPosition({kRowLabelX, y - kInfoOffsetY});
+                noneLbl->setPosition({12.f, y - 20.f});
                 noneLbl->setColor({130, 130, 130});
                 m_container->addChild(noneLbl);
             }
-            y -= kEntryStepY;
+
+            y -= 75.f;
         }
 
-        auto* rMenu = CCMenu::create();
-        rMenu->setPosition({0.f, 0.f});
-        m_container->addChild(rMenu);
+        auto* refreshMenu = CCMenu::create();
+        refreshMenu->setPosition({0.f, 0.f});
+        m_container->addChild(refreshMenu);
 
-        auto* rSpr = ButtonSprite::create("Refresh", "bigFont.fnt", "GJ_button_04.png", 0.7f);
-        rSpr->setScale(0.5f);
-        auto* rBtn = CCMenuItemSpriteExtra::create(
-            rSpr, this, menu_selector(ManageBackupsPopup::onRefresh)
+        auto* refreshSpr = ButtonSprite::create(
+            "Refresh", "bigFont.fnt", "GJ_button_04.png", 0.7f
         );
-        rBtn->setPosition({170.f, 28.f});
-        rMenu->addChild(rBtn);
+        refreshSpr->setScale(0.5f);
+        auto* refreshBtn = CCMenuItemSpriteExtra::create(
+            refreshSpr, this,
+            menu_selector(ManageBackupsPopup::onRefresh)
+        );
+        refreshBtn->setPosition({170.f, 28.f});
+        refreshMenu->addChild(refreshBtn);
     }
 
-    void onRefresh(CCObject*) { loadEntries(); buildUI(); }
+    void onRefresh(CCObject*) {
+        loadEntries();
+        buildUI();
+    }
 
     void onRestore(CCObject* sender) {
         auto* btn = static_cast<CCMenuItemSpriteExtra*>(sender);
         auto* obj = static_cast<CCString*>(btn->getUserObject());
         if (!obj) return;
+
         std::string name = obj->getCString();
+
         createQuickPopup(
             "Restore Backup",
             ("Restore from " + name + "?\nThis will restart the game.").c_str(),
             "Cancel", "Restore",
-            [name](auto*, bool ok) { if (ok) restoreFromBackup(name); }
+            [name](auto*, bool ok) {
+                if (ok) restoreFromBackup(name);
+            }
         );
     }
 
@@ -225,17 +247,20 @@ protected:
         auto* btn = static_cast<CCMenuItemSpriteExtra*>(sender);
         auto* obj = static_cast<CCString*>(btn->getUserObject());
         if (!obj) return;
+
         std::string name = obj->getCString();
+
         createQuickPopup(
-            "Delete Backup", ("Delete " + name + "?").c_str(),
+            "Delete Backup",
+            ("Delete " + name + "?").c_str(),
             "Cancel", "Delete",
             [this, name](auto*, bool ok) {
                 if (!ok) return;
                 std::error_code ec;
-                std::filesystem::remove(Mod::get()->getSaveDir() / name, ec);
+            std::filesystem::remove(Mod::get()->getSaveDir() / name, ec);
                 if (ec) {
-                    log::warn("[BetterSaving] delete failed for {}: {}", name, ec.message());
                     Notification::create("Delete failed!", NotificationIcon::Error)->show();
+                    log::warn("[Better Saving] Delete failed for {}: {}", name, ec.message());
                 } else {
                     Notification::create("Backup deleted", NotificationIcon::Success)->show();
                 }
@@ -247,39 +272,31 @@ protected:
 public:
     static ManageBackupsPopup* create() {
         auto* ret = new ManageBackupsPopup();
-        if (ret->init()) { ret->autorelease(); return ret; }
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
         delete ret;
         return nullptr;
     }
 };
-
-// reduces the 6-line boilerplate that each custom setting parse() needs
-template <typename T>
-static Result<std::shared_ptr<SettingV3>> parseCustomSetting(
-    std::string const& key, std::string const& modID,
-    matjson::Value const& json, const char* typeName
-) {
-    auto res  = std::make_shared<T>();
-    auto root = checkJson(json, typeName);
-    res->init(key, modID, root);
-    res->parseNameAndDescription(root);
-    res->parseEnableIf(root);
-    root.checkUnknownKeys();
-    return root.ok(std::static_pointer_cast<SettingV3>(res));
-}
-
-// ---- force save button ----
 
 class ForceSaveSettingV3 : public SettingV3 {
 public:
     static Result<std::shared_ptr<SettingV3>> parse(
         std::string const& key, std::string const& modID, matjson::Value const& json
     ) {
-        return parseCustomSetting<ForceSaveSettingV3>(key, modID, json, "ForceSaveSettingV3");
+        auto res  = std::make_shared<ForceSaveSettingV3>();
+        auto root = checkJson(json, "ForceSaveSettingV3");
+        res->init(key, modID, root);
+        res->parseNameAndDescription(root);
+        res->parseEnableIf(root);
+        root.checkUnknownKeys();
+        return root.ok(std::static_pointer_cast<SettingV3>(res));
     }
-    bool load(matjson::Value const&) override { return true; }
-    bool save(matjson::Value&)  const override { return true; }
-    bool isDefaultValue()       const override { return true; }
+    bool load(matjson::Value const& json) override { return true; }
+    bool save(matjson::Value& json) const override { return true; }
+    bool isDefaultValue() const override { return true; }
     void reset() override {}
     SettingNodeV3* createNode(float width) override;
 };
@@ -291,7 +308,10 @@ protected:
 
     bool init(std::shared_ptr<ForceSaveSettingV3> setting, float width) {
         if (!SettingNodeV3::init(setting, width)) return false;
-        m_buttonSprite = ButtonSprite::create("Save Now", "goldFont.fnt", "GJ_button_01.png", 0.8f);
+
+        m_buttonSprite = ButtonSprite::create(
+            "Save Now", "goldFont.fnt", "GJ_button_01.png", 0.8f
+        );
         m_buttonSprite->setScale(0.5f);
         m_button = CCMenuItemSpriteExtra::create(
             m_buttonSprite, this, menu_selector(ForceSaveSettingNode::onForceSave)
@@ -305,7 +325,7 @@ protected:
 
     void updateState(CCNode* invoker) override {
         SettingNodeV3::updateState(invoker);
-        bool on = this->getSetting()->shouldEnable();
+        auto on = this->getSetting()->shouldEnable();
         m_button->setEnabled(on);
         m_buttonSprite->setCascadeColorEnabled(true);
         m_buttonSprite->setCascadeOpacityEnabled(true);
@@ -318,8 +338,10 @@ protected:
     void onResetToDefault() override {}
 
 public:
-    static ForceSaveSettingNode* create(std::shared_ptr<ForceSaveSettingV3> setting, float width) {
-        auto* ret = new ForceSaveSettingNode();
+    static ForceSaveSettingNode* create(
+        std::shared_ptr<ForceSaveSettingV3> setting, float width
+    ) {
+        auto ret = new ForceSaveSettingNode();
         if (ret->init(setting, width)) { ret->autorelease(); return ret; }
         delete ret;
         return nullptr;
@@ -334,18 +356,22 @@ SettingNodeV3* ForceSaveSettingV3::createNode(float width) {
     );
 }
 
-// ---- backup manager button ----
-
 class BackupManagerSettingV3 : public SettingV3 {
 public:
     static Result<std::shared_ptr<SettingV3>> parse(
         std::string const& key, std::string const& modID, matjson::Value const& json
     ) {
-        return parseCustomSetting<BackupManagerSettingV3>(key, modID, json, "BackupManagerSettingV3");
+        auto res  = std::make_shared<BackupManagerSettingV3>();
+        auto root = checkJson(json, "BackupManagerSettingV3");
+        res->init(key, modID, root);
+        res->parseNameAndDescription(root);
+        res->parseEnableIf(root);
+        root.checkUnknownKeys();
+        return root.ok(std::static_pointer_cast<SettingV3>(res));
     }
-    bool load(matjson::Value const&) override { return true; }
-    bool save(matjson::Value&)  const override { return true; }
-    bool isDefaultValue()       const override { return true; }
+    bool load(matjson::Value const& json) override { return true; }
+    bool save(matjson::Value& json) const override { return true; }
+    bool isDefaultValue() const override { return true; }
     void reset() override {}
     SettingNodeV3* createNode(float width) override;
 };
@@ -357,10 +383,14 @@ protected:
 
     bool init(std::shared_ptr<BackupManagerSettingV3> setting, float width) {
         if (!SettingNodeV3::init(setting, width)) return false;
-        m_buttonSprite = ButtonSprite::create("Manage", "bigFont.fnt", "GJ_button_04.png", 0.8f);
+
+        m_buttonSprite = ButtonSprite::create(
+            "Manage", "bigFont.fnt", "GJ_button_04.png", 0.8f
+        );
         m_buttonSprite->setScale(0.5f);
         m_button = CCMenuItemSpriteExtra::create(
-            m_buttonSprite, this, menu_selector(BackupManagerSettingNode::onManage)
+            m_buttonSprite, this,
+            menu_selector(BackupManagerSettingNode::onManage)
         );
         this->getButtonMenu()->addChildAtPosition(m_button, Anchor::Center);
         this->getButtonMenu()->setContentWidth(80.f);
@@ -371,11 +401,12 @@ protected:
 
     void updateState(CCNode* invoker) override {
         SettingNodeV3::updateState(invoker);
-        bool on = this->getSetting()->shouldEnable();
+        auto on = this->getSetting()->shouldEnable();
         m_button->setEnabled(on);
         m_buttonSprite->setCascadeColorEnabled(true);
         m_buttonSprite->setCascadeOpacityEnabled(true);
-        m_buttonSprite->setColor(on ? ccColor3B{100, 220, 255} : ccGRAY); // cyan = active
+        // Cyan when active, grey when disabled
+        m_buttonSprite->setColor(on ? ccColor3B{100, 220, 255} : ccGRAY);
         m_buttonSprite->setOpacity(on ? 255 : 155);
     }
 
@@ -384,8 +415,10 @@ protected:
     void onResetToDefault() override {}
 
 public:
-    static BackupManagerSettingNode* create(std::shared_ptr<BackupManagerSettingV3> setting, float width) {
-        auto* ret = new BackupManagerSettingNode();
+    static BackupManagerSettingNode* create(
+        std::shared_ptr<BackupManagerSettingV3> setting, float width
+    ) {
+        auto ret = new BackupManagerSettingNode();
         if (ret->init(setting, width)) { ret->autorelease(); return ret; }
         delete ret;
         return nullptr;
@@ -400,32 +433,38 @@ SettingNodeV3* BackupManagerSettingV3::createNode(float width) {
     );
 }
 
-// ---- last save timestamp display ----
+// Shows "Last saved: HH:MM" in the settings panel, updates every second.
 
 class LastSaveDisplaySettingV3 : public SettingV3 {
 public:
     static Result<std::shared_ptr<SettingV3>> parse(
         std::string const& key, std::string const& modID, matjson::Value const& json
     ) {
-        return parseCustomSetting<LastSaveDisplaySettingV3>(key, modID, json, "LastSaveDisplaySettingV3");
+        auto res  = std::make_shared<LastSaveDisplaySettingV3>();
+        auto root = checkJson(json, "LastSaveDisplaySettingV3");
+        res->init(key, modID, root);
+        res->parseNameAndDescription(root);
+        res->parseEnableIf(root);
+        root.checkUnknownKeys();
+        return root.ok(std::static_pointer_cast<SettingV3>(res));
     }
-    bool load(matjson::Value const&) override { return true; }
-    bool save(matjson::Value&)  const override { return true; }
-    bool isDefaultValue()       const override { return true; }
+    bool load(matjson::Value const& json) override { return true; }
+    bool save(matjson::Value& json) const override { return true; }
+    bool isDefaultValue() const override { return true; }
     void reset() override {}
     SettingNodeV3* createNode(float width) override;
 };
 
 class LastSaveDisplayNode : public SettingNodeV3 {
 protected:
-    CCLabelBMFont* m_label             = nullptr;
+    CCLabelBMFont* m_label            = nullptr;
     int64_t        m_lastDisplayedTime = 0;
 
     bool init(std::shared_ptr<LastSaveDisplaySettingV3> setting, float width) {
         if (!SettingNodeV3::init(setting, width)) return false;
 
         m_lastDisplayedTime = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
-        auto text = std::string("Last saved: ") + fmtLastSaveTime(m_lastDisplayedTime);
+        std::string text = "Last saved: " + fmtLastSaveTime(m_lastDisplayedTime);
 
         m_label = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
         m_label->setScale(0.38f);
@@ -435,23 +474,26 @@ protected:
         this->getButtonMenu()->setContentWidth(160.f);
         this->getButtonMenu()->updateLayout();
 
-        this->schedule(schedule_selector(LastSaveDisplayNode::refreshLabel), 1.0f);
+        this->schedule(schedule_selector(LastSaveDisplayNode::updateTimeLabel), 1.0f);
         return true;
     }
 
-    void refreshLabel(float) {
-        auto ts = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
-        if (ts == m_lastDisplayedTime) return;
-        m_lastDisplayedTime = ts;
-        m_label->setString(("Last saved: " + fmtLastSaveTime(ts)).c_str());
+    void updateTimeLabel(float dt) {
+        auto currentTs = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
+        if (currentTs != m_lastDisplayedTime) {
+            m_lastDisplayedTime = currentTs;
+            m_label->setString(("Last saved: " + fmtLastSaveTime(currentTs)).c_str());
+        }
     }
 
     void onCommit() override {}
     void onResetToDefault() override {}
 
 public:
-    static LastSaveDisplayNode* create(std::shared_ptr<LastSaveDisplaySettingV3> setting, float width) {
-        auto* ret = new LastSaveDisplayNode();
+    static LastSaveDisplayNode* create(
+        std::shared_ptr<LastSaveDisplaySettingV3> setting, float width
+    ) {
+        auto ret = new LastSaveDisplayNode();
         if (ret->init(setting, width)) { ret->autorelease(); return ret; }
         delete ret;
         return nullptr;
@@ -466,39 +508,42 @@ SettingNodeV3* LastSaveDisplaySettingV3::createNode(float width) {
     );
 }
 
-// singleton that owns the scheduler and all mutable save state
+// Singleton CCNode that owns the scheduler and all save state.
+
 class AutoSaveManager : public CCNode {
 public:
-    float  m_accumulator  = 0.0f;
-    bool   m_pendingSave  = false;
-    bool   m_timerRunning = false;
+    float m_accumulator  = 0.0f;
+    bool  m_pendingSave  = false;
+    bool  m_timerRunning = false;
     std::chrono::steady_clock::time_point m_pendingTimestamp;
     std::chrono::steady_clock::time_point m_lastSaveTimestamp;
+
     CCSprite* m_pendingIcon = nullptr;
 
     static AutoSaveManager* get() {
-        static AutoSaveManager* inst = nullptr;
-        if (!inst) {
-            inst = new AutoSaveManager();
-            inst->init();
-            inst->retain();
-            CCDirector::get()->getScheduler()->resumeTarget(inst);
-            // push the last-save time way back so the first trigger isn't blocked by cooldown
-            inst->m_lastSaveTimestamp =
+        static AutoSaveManager* s_instance = nullptr;
+        if (!s_instance) {
+            s_instance = new AutoSaveManager();
+            s_instance->init();
+            s_instance->retain();
+            CCDirector::get()->getScheduler()->resumeTarget(s_instance);
+            s_instance->m_lastSaveTimestamp =
                 std::chrono::steady_clock::now() - std::chrono::seconds(3600);
         }
-        return inst;
+        return s_instance;
     }
 
     void addPendingIcon() {
         if (m_pendingIcon) return;
         auto* pl = PlayLayer::get();
         if (!pl) return;
-        auto vis  = CCDirector::get()->getVisibleSize();
+
+        auto visible  = CCDirector::get()->getVisibleSize();
         m_pendingIcon = CCSprite::create("GJ_infoIcon_001.png");
         if (!m_pendingIcon) return;
+
         m_pendingIcon->setScale(0.6f);
-        m_pendingIcon->setPosition({vis.width - 36.f, vis.height - 36.f});
+        m_pendingIcon->setPosition({ visible.width - 36.f, visible.height - 36.f });
         pl->addChild(m_pendingIcon, 1000);
     }
 
@@ -510,18 +555,24 @@ public:
 
     void checkPending() {
         if (!m_pendingSave) return;
-        if (!PlayLayer::get()) triggerSaveAttempt();
+        if (PlayLayer::get() == nullptr) triggerSaveAttempt();
     }
 
     void scheduleTimer() {
-        if (m_timerRunning) return;
+        if (m_timerRunning) {
+            if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+                log::info("[Better Saving] Timer already running أ¢â‚¬â€‌ skipping reschedule.");
+            return;
+        }
+
         CCDirector::get()->getScheduler()->scheduleSelector(
             schedule_selector(AutoSaveManager::updateTimer), this, 1.0f, false
         );
         m_accumulator  = 0.0f;
         m_timerRunning = true;
+
         if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[BetterSaving] timer started");
+            log::info("[Better Saving] Timer scheduled.");
     }
 
     void stopTimer() {
@@ -531,8 +582,9 @@ public:
         m_pendingSave  = false;
         m_accumulator  = 0.0f;
         m_timerRunning = false;
+
         if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[BetterSaving] timer stopped");
+            log::info("[Better Saving] Timer stopped.");
     }
 
     void updateTimer(float dt) {
@@ -544,12 +596,14 @@ public:
             auto ageMins = std::chrono::duration_cast<std::chrono::minutes>(
                 now - m_pendingTimestamp
             ).count();
+
             if (ageMins > Mod::get()->getSettingValue<int64_t>("pending-save-timeout")) {
                 m_pendingSave = false;
-                log::warn("[BetterSaving] pending save discarded after {}min", (int)ageMins);
+                log::warn("[Better Saving] Pending save expired after {} minutes أ¢â‚¬â€‌ discarded.", (int)ageMins);
                 removePendingIcon();
                 return;
             }
+
             triggerSaveAttempt();
             return;
         }
@@ -558,6 +612,7 @@ public:
         float targetSecs = static_cast<float>(
             Mod::get()->getSettingValue<int64_t>("save-interval") * 60
         );
+
         if (m_accumulator >= targetSecs) {
             m_accumulator = 0.0f;
             triggerSaveAttempt();
@@ -565,24 +620,26 @@ public:
     }
 
     void triggerSaveAttempt() {
-        bool inLevel  = PlayLayer::get() != nullptr;
-        bool inEditor = LevelEditorLayer::get() != nullptr;
-        bool editorOk = Mod::get()->getSettingValue<bool>("save-in-editor");
+        bool inLevel      = PlayLayer::get() != nullptr;
+        bool inEditor     = LevelEditorLayer::get() != nullptr;
+        bool saveInEditor = Mod::get()->getSettingValue<bool>("save-in-editor");
 
-        // don't save if a blocking alert popup is visible
-        bool modalUp = false;
-        if (auto* scene = CCDirector::get()->getRunningScene())
-            if (scene->getChildByType<FLAlertLayer>(0)) modalUp = true;
+        bool isModalActive = false;
+        if (auto* scene = CCDirector::get()->getRunningScene()) {
+            if (scene->getChildByType<FLAlertLayer>(0)) isModalActive = true;
+        }
 
-        if (inLevel || modalUp || (inEditor && !editorOk)) {
+        if (inLevel || isModalActive || (inEditor && !saveInEditor)) {
             if (!m_pendingSave) {
                 m_pendingSave      = true;
                 m_pendingTimestamp = std::chrono::steady_clock::now();
+
+                if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+                    log::info("[Better Saving] Save deferred: inLevel={} inEditor={} modal={}",
+                        inLevel, inEditor, isModalActive);
+
                 auto behavior = Mod::get()->getSettingValue<std::string>("defer-behavior");
                 if (behavior == "hud-icon" && inLevel) addPendingIcon();
-                if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-                    log::info("[BetterSaving] deferred (inLevel={} inEditor={} modal={})",
-                        inLevel, inEditor, modalUp);
             }
             return;
         }
@@ -600,8 +657,7 @@ static bool waitForFileReady(const std::filesystem::path& p, int maxRetries = 5)
     return false;
 }
 
-// copy src -> tmp, then atomically rename into place to avoid half-written backups
-static bool atomicCopy(
+bool atomicCopy(
     const std::filesystem::path& src,
     const std::filesystem::path& dst,
     std::error_code& ec
@@ -611,18 +667,17 @@ static bool atomicCopy(
 
     if (!waitForFileReady(src)) {
         ec = std::make_error_code(std::errc::resource_unavailable_try_again);
-        log::warn("[BetterSaving] source file locked: {}", src.string());
+        log::warn("[Better Saving] Source file locked after retries: {}", src.string());
         return false;
     }
 
-    for (int i = 0; i < 3; ++i) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
         std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
         if (!ec) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (ec) return false;
 
-    // rotate dst -> .old before promoting tmp -> dst
     auto old = dst.string() + ".old";
     if (std::filesystem::exists(dst, ec)) {
         std::filesystem::rename(dst, old, ec);
@@ -630,7 +685,7 @@ static bool atomicCopy(
     }
 
     ec = {};
-    for (int i = 0; i < 3; ++i) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
         std::filesystem::rename(tmp, dst, ec);
         if (!ec) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -638,39 +693,65 @@ static bool atomicCopy(
 
     std::error_code cleanEc;
     std::filesystem::remove(old, cleanEc);
+
     return !ec;
 }
 
-// slot: "Save_Backup.bak" for rolling saves, "Last_Safe_Save_Backup.bak" for exit/focus-loss
-void createBackup(const std::string& slot) {
+void doRollingBackup() {
     if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
 
     std::error_code ec;
-    auto src    = geode::dirs::getSaveDir() / "CCGameManager.dat";
+    auto mainFile = geode::dirs::getSaveDir() / "CCGameManager.dat";
     auto modDir = Mod::get()->getSaveDir();
     std::filesystem::create_directories(modDir, ec);
-    auto dst = modDir / slot;
+    auto b0 = modDir / "Save_Backup.bak";
 
-    if (!std::filesystem::exists(src, ec)) {
-        log::warn("[BetterSaving] CCGameManager.dat not found, skipping backup");
+    if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
+        log::info("[Better Saving] Source: {}", mainFile.string());
+        log::info("[Better Saving] Dest:   {}", b0.string());
+    }
+
+    if (!std::filesystem::exists(mainFile, ec)) {
+        log::warn("[Better Saving] CCGameManager.dat NOT found in GD folder! Skipping.");
         return;
     }
 
-    if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-        log::info("[BetterSaving] backup {} -> {}", src.string(), dst.string());
+    bool ok = atomicCopy(mainFile, b0, ec);
 
-    if (!atomicCopy(src, dst, ec) || ec) {
-        log::warn("[BetterSaving] backup to {} failed: {}", slot, ec.message());
+    if (!ok || ec) {
+        log::warn("[Better Saving] Backup failed: {} -> {}: {}", mainFile.string(), b0.string(), ec.message());
         Notification::create("Backup failed!", NotificationIcon::Error)->show();
     } else if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
-        log::info("[BetterSaving] backup {} ok", slot);
+        log::info("[Better Saving] Regular backup created successfully.");
+    }
+}
+
+void doSafeExitBackup() {
+    if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
+
+    std::error_code ec;
+    auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
+    
+    auto modDir = Mod::get()->getSaveDir();
+    std::filesystem::create_directories(modDir, ec);
+    auto safeFile = modDir / "Last_Safe_Save_Backup.bak";
+
+    if (!std::filesystem::exists(mainFile, ec)) return;
+
+    bool ok = atomicCopy(mainFile, safeFile, ec);
+
+    if (!ok || ec) {
+        log::warn("[Better Saving] Safe exit backup failed: {} -> {}: {}", mainFile.string(), safeFile.string(), ec.message());
+        Notification::create("Safe exit backup failed!", NotificationIcon::Error)->show();
+    } else if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
+        log::info("[Better Saving] Safe exit backup created.");
     }
 }
 
 bool restoreFromBackup(const std::string& backupName) {
     std::error_code ec;
     auto backupFile = Mod::get()->getSaveDir() / backupName;
-    auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat";
+auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
 
     if (!std::filesystem::exists(backupFile, ec)) {
         Notification::create("Backup not found!", NotificationIcon::Error)->show();
@@ -681,8 +762,9 @@ bool restoreFromBackup(const std::string& backupName) {
     AutoSaveManager::get()->removePendingIcon();
 
     atomicCopy(backupFile, mainFile, ec);
+
     if (ec) {
-        log::error("[BetterSaving] restore failed: {}", ec.message());
+        log::error("[Better Saving] Restore failed: {}", ec.message());
         AutoSaveManager::get()->scheduleTimer();
         Notification::create("Restore failed!", NotificationIcon::Error)->show();
         return false;
@@ -693,23 +775,28 @@ bool restoreFromBackup(const std::string& backupName) {
 }
 
 void runSaveLogic(bool force) {
-    auto  now     = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
     auto* manager = AutoSaveManager::get();
 
-    auto cooldown = Mod::get()->getSettingValue<int64_t>("save-cooldown");
-    auto elapsed  = std::chrono::duration_cast<std::chrono::seconds>(
+    auto cooldownSecs = Mod::get()->getSettingValue<int64_t>("save-cooldown");
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         now - manager->m_lastSaveTimestamp
     ).count();
 
-    if (!force && elapsed < cooldown) {
+    if (!force && elapsed < cooldownSecs) {
         if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[BetterSaving] skipped - cooldown ({}/{}s)", (long long)elapsed, (long long)cooldown);
-        if (Mod::get()->getSettingValue<bool>("show-notification")) {
+            log::info("[Better Saving] Save skipped أ¢â‚¬â€‌ cooldown ({}/{}s).",
+                (long long)elapsed, (long long)cooldownSecs);
+
+if (Mod::get()->getSettingValue<bool>("show-notification")) {
             auto last = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
-            auto msg  = last > 0
-                ? "Already saved at " + fmtLastSaveTime(last)
-                : std::string("Already saved recently");
-            Notification::create(msg.c_str(), NotificationIcon::Warning)->show();
+            if (last > 0) {
+                std::ostringstream ss;
+                ss << "Already saved at " << fmtLastSaveTime(last);
+                Notification::create(ss.str().c_str(), NotificationIcon::Warning)->show();
+            } else {
+                Notification::create("Already saved recently", NotificationIcon::Warning)->show();
+            }
         }
         return;
     }
@@ -724,11 +811,11 @@ void runSaveLogic(bool force) {
     try {
         gm->save();
     } catch (...) {
-        log::error("[BetterSaving] exception during gm->save()!");
+        log::error("[Better Saving] Exception thrown during save!");
         return;
     }
-
-    createBackup("Save_Backup.bak");
+    
+    doRollingBackup(); 
 
     manager->m_lastSaveTimestamp = now;
     manager->m_pendingSave       = false;
@@ -738,20 +825,12 @@ void runSaveLogic(bool force) {
         "last-save-time",
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
     );
-    Mod::get()->saveData();
+Mod::get()->saveData();
 
     if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-        log::info("[BetterSaving] save complete");
+        log::info("[Better Saving] Save executed successfully.");
     if (Mod::get()->getSettingValue<bool>("show-notification"))
         Notification::create("Game saved!", NotificationIcon::Success)->show();
-}
-
-// called on alt-tab (desktop) and app backgrounding (mobile)
-// cocos2d-x calls applicationWillResignActive from the WM_ACTIVATE handler on Windows too
-static void focusLostSave() {
-    if (!Mod::get()->getSettingValue<bool>("enabled")) return;
-    createBackup("Last_Safe_Save_Backup.bak");
-    runSaveLogic(true);
 }
 
 $execute {
@@ -789,26 +868,31 @@ class $modify(MyPlayLayer, PlayLayer) {
     void levelComplete() {
         PlayLayer::levelComplete();
 
-        if (this->m_isPracticeMode) return; // practice completions don't count
+        if (this->m_isPracticeMode) {
+            if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+                log::info("[Better Saving] Practice mode أ¢â‚¬â€‌ skipping save.");
+            return;
+        }
+
         if (!Mod::get()->getSettingValue<bool>("enabled")) return;
         if (!Mod::get()->getSettingValue<bool>("save-on-complete")) return;
 
-        // kLevelSaveDelay lets the results screen transition finish before we save
-        auto* seq = CCSequence::create(
-            CCDelayTime::create(kLevelSaveDelay),
-            CCCallFunc::create(this, callfunc_selector(MyPlayLayer::doPostLevelSave)),
+        auto sequence = CCSequence::create(
+            CCDelayTime::create(5.0f),
+            CCCallFunc::create(this, callfunc_selector(MyPlayLayer::triggerDelayedSave)),
             nullptr
         );
-        this->runAction(seq);
+        this->runAction(sequence);
     }
 
-    void doPostLevelSave() {
+    void triggerDelayedSave() {
         auto* manager = AutoSaveManager::get();
         manager->m_pendingSave = false;
         manager->removePendingIcon();
         runSaveLogic(true);
+
         if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[BetterSaving] post-level save triggered");
+            log::info("[Better Saving] Level complete save triggered.");
     }
 };
 
@@ -817,29 +901,40 @@ class $modify(MyMenuLayer, MenuLayer) {
         if (!MenuLayer::init()) return false;
 
         auto* manager = AutoSaveManager::get();
+
         if (Mod::get()->getSettingValue<bool>("enabled")) {
             bool wasPending = manager->m_pendingSave;
             manager->checkPending();
-            auto behavior = Mod::get()->getSettingValue<std::string>("defer-behavior");
-            if (wasPending && !manager->m_pendingSave && behavior == "toast-on-menu") {
+            bool nowPending = manager->m_pendingSave;
+            auto behavior   = Mod::get()->getSettingValue<std::string>("defer-behavior");
+
+            if (wasPending && !nowPending && behavior == "toast-on-menu") {
                 if (Mod::get()->getSettingValue<bool>("show-notification"))
                     Notification::create("Deferred save completed", NotificationIcon::Success)->show();
             }
+
             manager->removePendingIcon();
         }
 
 #if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
         auto winSize = CCDirector::get()->getWinSize();
-        auto* exitSpr = ButtonSprite::create("X", "bigFont.fnt", "GJ_button_06.png", 0.82f);
-        exitSpr->setScale(0.8f);
-        auto* exitBtn = CCMenuItemSpriteExtra::create(
-            exitSpr, this, menu_selector(MyMenuLayer::onMobileExit)
+
+        auto* exitSpr = ButtonSprite::create(
+            "X", "bigFont.fnt", "GJ_button_06.png", 0.82f
         );
+        exitSpr->setScale(0.8f);
+
+        auto* exitBtn = CCMenuItemSpriteExtra::create(
+            exitSpr, this,
+            menu_selector(MyMenuLayer::onMobileExit)
+        );
+
         auto* exitMenu = CCMenu::create();
         exitMenu->addChild(exitBtn);
-        exitMenu->setPosition({48.f, winSize.height - 48.f});
+        exitMenu->setPosition({ 48.f, winSize.height - 48.f });
         this->addChild(exitMenu, 10);
 #endif
+
         return true;
     }
 
@@ -851,7 +946,7 @@ class $modify(MyMenuLayer, MenuLayer) {
             "Cancel", "Exit",
             [](auto*, bool ok) {
                 if (!ok) return;
-                createBackup("Last_Safe_Save_Backup.bak");
+                doSafeExitBackup();
                 runSaveLogic(true);
                 Mod::get()->saveData();
                 CCDirector::get()->end();
@@ -861,16 +956,9 @@ class $modify(MyMenuLayer, MenuLayer) {
 #endif
 
     void onQuit(CCObject* sender) {
-        createBackup("Last_Safe_Save_Backup.bak");
+        doSafeExitBackup();
         MenuLayer::onQuit(sender);
     }
 };
 
-// fires on focus loss: alt-tab on Windows (via WM_ACTIVATE -> applicationWillResignActive)
-// and app backgrounding on Android/iOS
-class $modify(MyAppDelegate, AppDelegate) {
-    void applicationWillResignActive() {
-        AppDelegate::applicationWillResignActive();
-        focusLostSave();
-    }
-};
+//end :)
