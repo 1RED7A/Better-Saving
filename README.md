@@ -1,5 +1,5 @@
 # Better-Saving
-Reliable manual, autosave and backups for Geometry Dash.
+Reliable manual/auto save and backups for Geometry Dash.
 
 <img src="logo.png" width="150" alt="Better Saving logo" />
 
