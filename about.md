@@ -23,19 +23,6 @@ More features and enhancements are coming soon in future updates.
 
 ---
 
-## How to Use
-
-1. Install the mod — it works out of the box with safe defaults.  
-2. Open the mod settings and take a look around.  
-3. **Android users:** use the exit button in the main menu; it saves automatically before closing, no extra steps needed.  
-4. Adjust the save interval, backup options, and notifications to your taste.  
-5. Use the **Save Now** button in the settings whenever you want to save immediately.  
-6. If needed, open **Manage Backups** to restore a previous save.  
-
-That’s really it. The mod runs quietly in the background and handles the rest.
-
----
-
 ## Good to Know
 
 - **The mod will cause a brief freeze whenever a save happens** — be careful not to trigger too many saves too quickly.  
