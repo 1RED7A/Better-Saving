@@ -9,9 +9,9 @@
     },
     "id": "1red7a.better-saving",
     "name": "Better-Saving",
-    "version": "v1.1.0",
+    "version": "v1.2.0",
     "developer": "1RED7A",
-    "description": "Automatically saves your game data at a regular interval with rolling backups and restore tools. Manual Saving also exists.",
+    "description": "Automatically saves your game data at a regular interval with rolling backups and restore tools. Manual saving also available.",
     "dependencies": {
         "geode.node-ids": ">=v1.23.3"
     },
@@ -46,7 +46,7 @@
         },
         "save-cooldown": {
             "name": "Save Cooldown (seconds)",
-            "description": "Minimum time between saves. Prevents saving too frequently. Recommended not to touch this value.",
+            "description": "Minimum time between saves. Prevents saving too frequently. Recommended to leave this at its default.",
             "type": "int",
             "default": 30,
             "min": 5,
@@ -77,6 +77,15 @@
             "default": true,
             "enable-if": "enabled"
         },
+        "level-complete-delay": {
+            "name": "Level Complete Save Delay (seconds)",
+            "description": "How long to wait after completing a level before saving. Gives GD time to finish its own stat updates.",
+            "type": "int",
+            "default": 5,
+            "min": 1,
+            "max": 30,
+            "enable-if": "enabled"
+        },
         "save-in-editor": {
             "name": "Save in Editor",
             "description": "Allow saving while in the level editor. May cause a brief freeze.",
@@ -86,7 +95,7 @@
         },
         "enable-backups": {
             "name": "Enable Backups",
-            "description": "Create a rolling backup after each save and a safe-exit backup when quitting cleanly.",
+            "description": "Create a rolling backup after each save and a safe-exit backup when quitting or losing focus.",
             "type": "bool",
             "default": true,
             "enable-if": "enabled"
