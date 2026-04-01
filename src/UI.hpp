@@ -30,7 +30,9 @@ protected:
     std::vector<BackupEntry> m_entries;
     CCNode* m_container = nullptr;
 
-    bool init() override;
+    // Popup<> requires init to match the base signature exactly.
+    // No 'override' here - Popup<>'s init is protected and non-virtual.
+    bool init();
 
     void loadEntries();
     void buildUI();
