@@ -81,7 +81,7 @@ void runSaveLogic(bool force) {
         "last-save-time",
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
     );
-    Mod::get()->saveData();
+    (void)Mod::get()->saveData();
 
     if (Mod::get()->getSettingValue<bool>("verbose-logging"))
         log::info("[Better Saving] Save completed successfully.");
