@@ -1,6 +1,6 @@
 # v1.1.0
-- Added iOS support
-- Added support links
+- Added iOS and Mac support
+- Added Ko_fi support link
 - Cleaned up some files
 
 # v1.0.0
