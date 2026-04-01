@@ -23,7 +23,7 @@ $execute {
     listenForSettingChanges<bool>("enabled", [](bool on) {
         if (on) AutoSaveManager::get()->scheduleTimer();
         else    AutoSaveManager::get()->stopTimer();
-        Mod::get()->saveData();
+        (void)Mod::get()->saveData();
     });
 
     // Auto-save sub-toggle - same effect as the master but only controls
@@ -32,7 +32,7 @@ $execute {
         if (!Mod::get()->getSettingValue<bool>("enabled")) return;
         if (on) AutoSaveManager::get()->scheduleTimer();
         else    AutoSaveManager::get()->stopTimer();
-        Mod::get()->saveData();
+        (void)Mod::get()->saveData();
     });
 
     // When the interval changes, restart the timer so the new interval
@@ -41,6 +41,6 @@ $execute {
         if (!Mod::get()->getSettingValue<bool>("enabled")) return;
         AutoSaveManager::get()->stopTimer();
         AutoSaveManager::get()->scheduleTimer();
-        Mod::get()->saveData();
+        (void)Mod::get()->saveData();
     });
 }
