@@ -9,7 +9,7 @@
     },
     "id": "1red7a.better-saving",
     "name": "Better-Saving",
-    "version": "v1.1.0",
+    "version": "v1.1.1",
     "developer": "1RED7A",
     "description": "Automatically saves your game data at a regular interval with rolling backups and restore tools. Manual Saving also exists.",
     "dependencies": {
