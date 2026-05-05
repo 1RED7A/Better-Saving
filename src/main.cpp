@@ -1,10 +1,11 @@
-
 #include <Geode/Geode.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/GameManager.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/CCDirector.hpp>
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
+#include <Geode/binding/LocalLevelManager.hpp>
 #include <Geode/loader/Dirs.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -19,9 +20,9 @@
 using namespace geode::prelude;
 
 void runSaveLogic(bool force = false);
-void doRollingBackup();
-void doSafeExitBackup();
-bool restoreFromBackup(const std::string& backupName);
+void doRollingBackupAsync();
+void doSafeExitBackupSync();
+bool restoreFromBackup(const std::string& slotId);
 
 static std::atomic<bool> s_saving{false};
 
@@ -78,19 +79,431 @@ static std::string fmtLastSaveTime(int64_t timestamp) {
     return std::string(buf);
 }
 
-// Shows the 2 backup slots with Restore and Delete actions.
+// Singleton CCNode that owns the scheduler and all save state.
+class AutoSaveManager : public CCNode {
+public:
+    float m_accumulator  = 0.0f;
+    bool  m_pendingSave  = false;
+    bool  m_timerRunning = false;
+    
+    // Level complete timer variables
+    bool  m_levelCompletePending = false;
+    float m_levelCompleteTimer   = 0.0f;
+
+    std::chrono::steady_clock::time_point m_pendingTimestamp;
+    std::chrono::steady_clock::time_point m_lastSaveTimestamp;
+
+    CCSprite* m_pendingIcon = nullptr;
+
+    static AutoSaveManager* get() {
+        static AutoSaveManager* s_instance = nullptr;
+        if (!s_instance) {
+            s_instance = new AutoSaveManager();
+            s_instance->init();
+            s_instance->retain();
+            CCDirector::get()->getScheduler()->resumeTarget(s_instance);
+            s_instance->m_lastSaveTimestamp =
+                std::chrono::steady_clock::now() - std::chrono::seconds(3600);
+        }
+        return s_instance;
+    }
+
+    void addPendingIcon() {
+        if (m_pendingIcon) return;
+        auto* pl = PlayLayer::get();
+        if (!pl) return;
+
+        auto visible  = CCDirector::get()->getVisibleSize();
+        m_pendingIcon = CCSprite::create("GJ_infoIcon_001.png");
+        if (!m_pendingIcon) return;
+
+        m_pendingIcon->setScale(0.6f);
+        m_pendingIcon->setPosition({ visible.width - 36.f, visible.height - 36.f });
+        pl->addChild(m_pendingIcon, 1000);
+    }
+
+    void removePendingIcon() {
+        if (!m_pendingIcon) return;
+        m_pendingIcon->removeFromParentAndCleanup(true);
+        m_pendingIcon = nullptr;
+    }
+
+    void checkPending() {
+        if (!m_pendingSave) return;
+        if (PlayLayer::get() == nullptr) triggerSaveAttempt();
+    }
+
+    void scheduleTimer() {
+        if (m_timerRunning) {
+            if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+                log::info("[Better Saving] Timer already running — skipping reschedule.");
+            return;
+        }
+
+        CCDirector::get()->getScheduler()->scheduleSelector(
+            schedule_selector(AutoSaveManager::updateTimer), this, 1.0f, false
+        );
+        m_accumulator  = 0.0f;
+        m_timerRunning = true;
+
+        if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+            log::info("[Better Saving] Timer scheduled.");
+    }
+
+    void stopTimer() {
+        CCDirector::get()->getScheduler()->unscheduleSelector(
+            schedule_selector(AutoSaveManager::updateTimer), this
+        );
+        m_pendingSave  = false;
+        m_accumulator  = 0.0f;
+        m_timerRunning = false;
+        m_levelCompletePending = false;
+
+        if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+            log::info("[Better Saving] Timer stopped.");
+    }
+
+    void updateTimer(float dt) {
+        if (!Mod::get()->getSettingValue<bool>("enabled")) return;
+
+        // Process level complete delayed save globally
+        if (m_levelCompletePending) {
+            m_levelCompleteTimer -= dt;
+            if (m_levelCompleteTimer <= 0.0f) {
+                m_levelCompletePending = false;
+                m_pendingSave = false; // Reset standard pending logic just in case
+                removePendingIcon();
+                runSaveLogic(true);
+                
+                if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+                    log::info("[Better Saving] Level complete delayed save triggered.");
+            }
+        }
+
+        if (!Mod::get()->getSettingValue<bool>("auto-save-enabled")) return;
+
+        if (m_pendingSave) {
+            auto now     = std::chrono::steady_clock::now();
+            auto ageMins = std::chrono::duration_cast<std::chrono::minutes>(
+                now - m_pendingTimestamp
+            ).count();
+
+            if (ageMins > Mod::get()->getSettingValue<int64_t>("pending-save-timeout")) {
+                m_pendingSave = false;
+                log::warn("[Better Saving] Pending save expired after {} minutes — discarded.", (int)ageMins);
+                removePendingIcon();
+                return;
+            }
+
+            triggerSaveAttempt();
+            return;
+        }
+
+        m_accumulator += dt;
+        float targetSecs = static_cast<float>(
+            Mod::get()->getSettingValue<int64_t>("save-interval") * 60
+        );
+
+        if (m_accumulator >= targetSecs) {
+            m_accumulator = 0.0f;
+            triggerSaveAttempt();
+        }
+    }
+
+    void triggerSaveAttempt() {
+        bool inLevel      = PlayLayer::get() != nullptr;
+        bool inEditor     = LevelEditorLayer::get() != nullptr;
+        bool saveInEditor = Mod::get()->getSettingValue<bool>("save-in-editor");
+
+        bool isModalActive = false;
+        if (auto* scene = CCDirector::get()->getRunningScene()) {
+            if (scene->getChildByType<FLAlertLayer>(0)) isModalActive = true;
+        }
+
+        if (inLevel || isModalActive || (inEditor && !saveInEditor)) {
+            if (!m_pendingSave) {
+                m_pendingSave      = true;
+                m_pendingTimestamp = std::chrono::steady_clock::now();
+
+                if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+                    log::info("[Better Saving] Save deferred: inLevel={} inEditor={} modal={}",
+                        inLevel, inEditor, isModalActive);
+
+                auto behavior = Mod::get()->getSettingValue<std::string>("defer-behavior");
+                if (behavior == "hud-icon" && inLevel) addPendingIcon();
+            }
+            return;
+        }
+
+        runSaveLogic();
+    }
+};
+
+static bool waitForFileReady(const std::filesystem::path& p, int maxRetries = 5) {
+    for (int i = 0; i < maxRetries; ++i) {
+        std::ifstream f(p, std::ios::binary);
+        if (f.is_open()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+}
+
+bool atomicCopy(
+    const std::filesystem::path& src,
+    const std::filesystem::path& dst,
+    std::error_code& ec
+) {
+    if (!waitForFileReady(src)) {
+        ec = std::make_error_code(std::errc::resource_unavailable_try_again);
+        log::warn("[Better Saving] Source file locked after retries: {}", src.string());
+        return false;
+    }
+
+    // Sanity Check: Ensure the file size makes sense before backing it up. 
+    // A save file under 1KB is heavily indicative of a corrupted 0-byte overwrite.
+    std::error_code sizeEc;
+    auto srcSize = std::filesystem::file_size(src, sizeEc);
+    if (!sizeEc && srcSize < 1024) {
+        log::error("[Better Saving] SANITY CHECK FAILED: Source file {} is suspiciously small ({} bytes). Backup blocked to prevent backup corruption.", src.string(), srcSize);
+        ec = std::make_error_code(std::errc::file_too_large); // Use arbitrary error code to indicate failure
+        return false;
+    }
+
+    auto tmp = dst.string() + ".tmp." +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (ec) return false;
+
+    auto old = dst.string() + ".old";
+    if (std::filesystem::exists(dst, ec)) {
+        std::filesystem::rename(dst, old, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec); // clean up tmp
+            return false;
+        }
+    }
+
+    ec = {};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::filesystem::rename(tmp, dst, ec);
+        if (!ec) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Rollback protection! If rename failed, we MUST put the .old file back so backups aren't lost
+    if (ec) {
+        log::warn("[Better Saving] Rename to destination failed, rolling back to previous backup...");
+        std::error_code rollbackEc;
+        std::filesystem::rename(old, dst, rollbackEc);
+        std::filesystem::remove(tmp, rollbackEc);
+        return false;
+    }
+
+    // Only delete .old if everything was perfectly successful
+    std::error_code cleanEc;
+    std::filesystem::remove(old, cleanEc);
+
+    return true;
+}
+
+void doRollingBackupAsync() {
+    if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
+
+    // Run this process asynchronously so copying doesn't drop gameplay frames!
+    std::thread([]() {
+        std::error_code ec;
+        auto mainFile = geode::dirs::getSaveDir() / "CCGameManager.dat";
+        auto modDir = Mod::get()->getSaveDir();
+        std::filesystem::create_directories(modDir, ec);
+        auto b0 = modDir / "Save_Backup.bak";
+
+        if (!std::filesystem::exists(mainFile, ec)) {
+            log::warn("[Better Saving] CCGameManager.dat NOT found in GD folder! Skipping.");
+            return;
+        }
+
+        bool ok = atomicCopy(mainFile, b0, ec);
+
+        if (!ok || ec) {
+            log::warn("[Better Saving] Async backup failed: {} -> {}: {}", mainFile.string(), b0.string(), ec.message());
+            geode::Loader::get()->queueInMainThread([]() {
+                Notification::create("Backup failed!", NotificationIcon::Error)->show();
+            });
+        } else if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
+            log::info("[Better Saving] Async regular backup created successfully.");
+        }
+    }).detach();
+}
+
+void doSafeExitBackupSync() {
+    if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
+
+    log::info("[Better Saving] Executing Safe Exit Backup synchronously...");
+
+    // Force GD to save latest data directly before we copy it
+    auto* gm = GameManager::get();
+    if (gm) gm->save();
+    auto* llm = LocalLevelManager::get();
+    if (llm) llm->save();
+
+    std::error_code ec;
+    auto gdSaveDir  = geode::dirs::getSaveDir();
+    auto modDir     = Mod::get()->getSaveDir();
+    std::filesystem::create_directories(modDir, ec);
+
+    auto mainFile   = gdSaveDir / "CCGameManager.dat";
+    auto levelsFile = gdSaveDir / "CCLocalLevels.dat";
+
+    auto safeMain   = modDir / "Last_Safe_Save_Backup.bak";
+    auto safeLevels = modDir / "Last_Safe_Levels_Backup.bak";
+
+    if (std::filesystem::exists(mainFile, ec)) {
+        if (!atomicCopy(mainFile, safeMain, ec)) 
+            log::error("[Better Saving] Failed to safely backup GameManager.");
+    }
+    
+    if (std::filesystem::exists(levelsFile, ec)) {
+        if (!atomicCopy(levelsFile, safeLevels, ec)) 
+            log::error("[Better Saving] Failed to safely backup LocalLevels.");
+    }
+
+    log::info("[Better Saving] Safe exit backup completed.");
+}
+
+bool restoreFromBackup(const std::string& slotId) {
+    std::error_code ec;
+    auto gdSaveDir = geode::dirs::getSaveDir();
+    auto modDir    = Mod::get()->getSaveDir();
+
+    AutoSaveManager::get()->stopTimer();
+    AutoSaveManager::get()->removePendingIcon();
+
+    bool success = true;
+
+    if (slotId == "rolling") {
+        auto backupFile = modDir / "Save_Backup.bak";
+        auto mainFile   = gdSaveDir / "CCGameManager.dat"; 
+
+        if (!std::filesystem::exists(backupFile, ec)) {
+            Notification::create("Backup not found!", NotificationIcon::Error)->show();
+            return false;
+        }
+        if (!atomicCopy(backupFile, mainFile, ec)) success = false;
+
+    } else if (slotId == "safe") {
+        auto backupMain = modDir / "Last_Safe_Save_Backup.bak";
+        auto mainFile   = gdSaveDir / "CCGameManager.dat"; 
+        
+        auto backupLevels = modDir / "Last_Safe_Levels_Backup.bak";
+        auto levelsFile   = gdSaveDir / "CCLocalLevels.dat"; 
+
+        bool foundAny = false;
+
+        if (std::filesystem::exists(backupMain, ec)) {
+            foundAny = true;
+            if (!atomicCopy(backupMain, mainFile, ec)) success = false;
+        }
+
+        if (std::filesystem::exists(backupLevels, ec)) {
+            foundAny = true;
+            if (!atomicCopy(backupLevels, levelsFile, ec)) success = false;
+        }
+
+        if (!foundAny) {
+            Notification::create("No Safe Backups found!", NotificationIcon::Error)->show();
+            return false;
+        }
+    }
+
+    if (!success) {
+        log::error("[Better Saving] Restore encountered an error.");
+        AutoSaveManager::get()->scheduleTimer();
+        Notification::create("Restore failed!", NotificationIcon::Error)->show();
+        return false;
+    }
+
+    geode::utils::game::restart(false);
+    return true;
+}
+
+void runSaveLogic(bool force) {
+    auto now = std::chrono::steady_clock::now();
+    auto* manager = AutoSaveManager::get();
+
+    auto cooldownSecs = Mod::get()->getSettingValue<int64_t>("save-cooldown");
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        now - manager->m_lastSaveTimestamp
+    ).count();
+
+    if (!force && elapsed < cooldownSecs) {
+        if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+            log::info("[Better Saving] Save skipped — cooldown ({}/{}s).",
+                (long long)elapsed, (long long)cooldownSecs);
+
+        if (Mod::get()->getSettingValue<bool>("show-notification")) {
+            auto last = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
+            if (last > 0) {
+                std::ostringstream ss;
+                ss << "Already saved at " << fmtLastSaveTime(last);
+                Notification::create(ss.str().c_str(), NotificationIcon::Warning)->show();
+            } else {
+                Notification::create("Already saved recently", NotificationIcon::Warning)->show();
+            }
+        }
+        return;
+    }
+
+    auto* gm = GameManager::get();
+    if (!gm) return;
+
+    bool expected = false;
+    if (!s_saving.compare_exchange_strong(expected, true)) return;
+    SavingGuard guard;
+
+    try {
+        gm->save();
+    } catch (...) {
+        log::error("[Better Saving] Exception thrown during save!");
+        return;
+    }
+    
+    // Using Asynchronous backup instead!
+    doRollingBackupAsync(); 
+
+    manager->m_lastSaveTimestamp = now;
+    manager->m_pendingSave       = false;
+    manager->removePendingIcon();
+
+    Mod::get()->setSavedValue<int64_t>(
+        "last-save-time",
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
+    );
+    Mod::get()->saveData();
+
+    if (Mod::get()->getSettingValue<bool>("verbose-logging"))
+        log::info("[Better Saving] Save executed successfully.");
+    if (Mod::get()->getSettingValue<bool>("show-notification"))
+        Notification::create("Game saved!", NotificationIcon::Success)->show();
+}
+
+// UI Classes
 
 class ManageBackupsPopup : public geode::Popup {
 protected:
-    struct BackupEntry {
-        std::string name;
+    struct BackupSlot {
+        std::string id; 
         std::string displayName;
         std::string timeStr;
         std::string sizeStr;
         bool exists = false;
     };
 
-    std::vector<BackupEntry> m_entries;
+    std::vector<BackupSlot> m_entries;
     CCNode* m_container = nullptr;
 
     bool init() {
@@ -124,21 +537,44 @@ protected:
         std::error_code ec;
         auto dir = Mod::get()->getSaveDir();
 
-        auto makeEntry = [&](const std::string& name, const std::string& displayName) {
-            BackupEntry e;
-            e.name        = name;
-            e.displayName = displayName;
-            auto p        = dir / name;
-            e.exists      = std::filesystem::exists(p, ec);
-            if (e.exists) {
-                e.timeStr = fmtFileTime(std::filesystem::last_write_time(p, ec));
-                e.sizeStr = humanSize(std::filesystem::file_size(p, ec));
-            }
-            m_entries.push_back(e);
-        };
+        // 1. Regular Rolling Backup
+        BackupSlot rolling;
+        rolling.id = "rolling";
+        rolling.displayName = "Regular Backup";
+        auto pRoll = dir / "Save_Backup.bak";
+        rolling.exists = std::filesystem::exists(pRoll, ec);
+        if (rolling.exists) {
+            rolling.timeStr = fmtFileTime(std::filesystem::last_write_time(pRoll, ec));
+            rolling.sizeStr = humanSize(std::filesystem::file_size(pRoll, ec));
+        }
+        m_entries.push_back(rolling);
 
-        makeEntry("Save_Backup.bak",           "Regular Backup");
-        makeEntry("Last_Safe_Save_Backup.bak", "Safe Exit Backup");
+        // 2. Safe Exit Backup (combines GameManager + LocalLevels sizes)
+        BackupSlot safe;
+        safe.id = "safe";
+        safe.displayName = "Safe Exit Backup";
+        auto pSafeMain   = dir / "Last_Safe_Save_Backup.bak";
+        auto pSafeLevels = dir / "Last_Safe_Levels_Backup.bak";
+        
+        bool safeMainExists   = std::filesystem::exists(pSafeMain, ec);
+        bool safeLevelsExists = std::filesystem::exists(pSafeLevels, ec);
+
+        if (safeMainExists || safeLevelsExists) {
+            safe.exists = true;
+            uint64_t totalSize = 0;
+            if (safeMainExists) {
+                totalSize += std::filesystem::file_size(pSafeMain, ec);
+                safe.timeStr = fmtFileTime(std::filesystem::last_write_time(pSafeMain, ec)); // Time based on main save
+            }
+            if (safeLevelsExists) {
+                totalSize += std::filesystem::file_size(pSafeLevels, ec);
+                if (!safeMainExists) {
+                    safe.timeStr = fmtFileTime(std::filesystem::last_write_time(pSafeLevels, ec));
+                }
+            }
+            safe.sizeStr = humanSize(totalSize);
+        }
+        m_entries.push_back(safe);
     }
 
     void buildUI() {
@@ -177,7 +613,7 @@ protected:
                     restoreSpr, this,
                     menu_selector(ManageBackupsPopup::onRestore)
                 );
-                restoreBtn->setUserObject(CCString::create(e.name));
+                restoreBtn->setUserObject(CCString::create(e.id));
                 restoreBtn->setPosition({235.f, y - 8.f});
                 menu->addChild(restoreBtn);
 
@@ -189,7 +625,7 @@ protected:
                     deleteSpr, this,
                     menu_selector(ManageBackupsPopup::onDelete)
                 );
-                deleteBtn->setUserObject(CCString::create(e.name));
+                deleteBtn->setUserObject(CCString::create(e.id));
                 deleteBtn->setPosition({304.f, y - 8.f});
                 menu->addChild(deleteBtn);
 
@@ -231,14 +667,14 @@ protected:
         auto* obj = static_cast<CCString*>(btn->getUserObject());
         if (!obj) return;
 
-        std::string name = obj->getCString();
+        std::string slotId = obj->getCString();
+        std::string dispName = slotId == "rolling" ? "Regular Backup" : "Safe Exit Backup";
 
         createQuickPopup(
             "Restore Backup",
-            ("Restore from " + name + "?\nThis will restart the game.").c_str(),
-            "Cancel", "Restore",
-            [name](auto*, bool ok) {
-                if (ok) restoreFromBackup(name);
+            ("Restore from " + dispName + "?\nThis will restart the game.").c_str(),
+            "Cancel", "Restore",[slotId](auto*, bool ok) {
+                if (ok) restoreFromBackup(slotId);
             }
         );
     }
@@ -248,23 +684,32 @@ protected:
         auto* obj = static_cast<CCString*>(btn->getUserObject());
         if (!obj) return;
 
-        std::string name = obj->getCString();
+        std::string slotId = obj->getCString();
+        std::string dispName = slotId == "rolling" ? "Regular Backup" : "Safe Exit Backup";
 
         createQuickPopup(
             "Delete Backup",
-            ("Delete " + name + "?").c_str(),
+            ("Delete " + dispName + "?").c_str(),
             "Cancel", "Delete",
-            [this, name](auto*, bool ok) {
+            [slotId](auto*, bool ok) {
                 if (!ok) return;
                 std::error_code ec;
-            std::filesystem::remove(Mod::get()->getSaveDir() / name, ec);
+                auto dir = Mod::get()->getSaveDir();
+
+                if (slotId == "rolling") {
+                    std::filesystem::remove(dir / "Save_Backup.bak", ec);
+                } else {
+                    std::filesystem::remove(dir / "Last_Safe_Save_Backup.bak", ec);
+                    std::filesystem::remove(dir / "Last_Safe_Levels_Backup.bak", ec);
+                }
+
                 if (ec) {
                     Notification::create("Delete failed!", NotificationIcon::Error)->show();
-                    log::warn("[Better Saving] Delete failed for {}: {}", name, ec.message());
+                    log::warn("[Better Saving] Delete failed for {}: {}", slotId, ec.message());
                 } else {
                     Notification::create("Backup deleted", NotificationIcon::Success)->show();
                 }
-                this->onClose(nullptr);
+                // Automatically updates on next refresh tick without closing window
             }
         );
     }
@@ -405,7 +850,6 @@ protected:
         m_button->setEnabled(on);
         m_buttonSprite->setCascadeColorEnabled(true);
         m_buttonSprite->setCascadeOpacityEnabled(true);
-        // Cyan when active, grey when disabled
         m_buttonSprite->setColor(on ? ccColor3B{100, 220, 255} : ccGRAY);
         m_buttonSprite->setOpacity(on ? 255 : 155);
     }
@@ -432,8 +876,6 @@ SettingNodeV3* BackupManagerSettingV3::createNode(float width) {
         std::static_pointer_cast<BackupManagerSettingV3>(shared_from_this()), width
     );
 }
-
-// Shows "Last saved: HH:MM" in the settings panel, updates every second.
 
 class LastSaveDisplaySettingV3 : public SettingV3 {
 public:
@@ -508,331 +950,6 @@ SettingNodeV3* LastSaveDisplaySettingV3::createNode(float width) {
     );
 }
 
-// Singleton CCNode that owns the scheduler and all save state.
-
-class AutoSaveManager : public CCNode {
-public:
-    float m_accumulator  = 0.0f;
-    bool  m_pendingSave  = false;
-    bool  m_timerRunning = false;
-    std::chrono::steady_clock::time_point m_pendingTimestamp;
-    std::chrono::steady_clock::time_point m_lastSaveTimestamp;
-
-    CCSprite* m_pendingIcon = nullptr;
-
-    static AutoSaveManager* get() {
-        static AutoSaveManager* s_instance = nullptr;
-        if (!s_instance) {
-            s_instance = new AutoSaveManager();
-            s_instance->init();
-            s_instance->retain();
-            CCDirector::get()->getScheduler()->resumeTarget(s_instance);
-            s_instance->m_lastSaveTimestamp =
-                std::chrono::steady_clock::now() - std::chrono::seconds(3600);
-        }
-        return s_instance;
-    }
-
-    void addPendingIcon() {
-        if (m_pendingIcon) return;
-        auto* pl = PlayLayer::get();
-        if (!pl) return;
-
-        auto visible  = CCDirector::get()->getVisibleSize();
-        m_pendingIcon = CCSprite::create("GJ_infoIcon_001.png");
-        if (!m_pendingIcon) return;
-
-        m_pendingIcon->setScale(0.6f);
-        m_pendingIcon->setPosition({ visible.width - 36.f, visible.height - 36.f });
-        pl->addChild(m_pendingIcon, 1000);
-    }
-
-    void removePendingIcon() {
-        if (!m_pendingIcon) return;
-        m_pendingIcon->removeFromParentAndCleanup(true);
-        m_pendingIcon = nullptr;
-    }
-
-    void checkPending() {
-        if (!m_pendingSave) return;
-        if (PlayLayer::get() == nullptr) triggerSaveAttempt();
-    }
-
-    void scheduleTimer() {
-        if (m_timerRunning) {
-            if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-                log::info("[Better Saving] Timer already running أ¢â‚¬â€‌ skipping reschedule.");
-            return;
-        }
-
-        CCDirector::get()->getScheduler()->scheduleSelector(
-            schedule_selector(AutoSaveManager::updateTimer), this, 1.0f, false
-        );
-        m_accumulator  = 0.0f;
-        m_timerRunning = true;
-
-        if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[Better Saving] Timer scheduled.");
-    }
-
-    void stopTimer() {
-        CCDirector::get()->getScheduler()->unscheduleSelector(
-            schedule_selector(AutoSaveManager::updateTimer), this
-        );
-        m_pendingSave  = false;
-        m_accumulator  = 0.0f;
-        m_timerRunning = false;
-
-        if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[Better Saving] Timer stopped.");
-    }
-
-    void updateTimer(float dt) {
-        if (!Mod::get()->getSettingValue<bool>("enabled")) return;
-        if (!Mod::get()->getSettingValue<bool>("auto-save-enabled")) return;
-
-        if (m_pendingSave) {
-            auto now     = std::chrono::steady_clock::now();
-            auto ageMins = std::chrono::duration_cast<std::chrono::minutes>(
-                now - m_pendingTimestamp
-            ).count();
-
-            if (ageMins > Mod::get()->getSettingValue<int64_t>("pending-save-timeout")) {
-                m_pendingSave = false;
-                log::warn("[Better Saving] Pending save expired after {} minutes أ¢â‚¬â€‌ discarded.", (int)ageMins);
-                removePendingIcon();
-                return;
-            }
-
-            triggerSaveAttempt();
-            return;
-        }
-
-        m_accumulator += dt;
-        float targetSecs = static_cast<float>(
-            Mod::get()->getSettingValue<int64_t>("save-interval") * 60
-        );
-
-        if (m_accumulator >= targetSecs) {
-            m_accumulator = 0.0f;
-            triggerSaveAttempt();
-        }
-    }
-
-    void triggerSaveAttempt() {
-        bool inLevel      = PlayLayer::get() != nullptr;
-        bool inEditor     = LevelEditorLayer::get() != nullptr;
-        bool saveInEditor = Mod::get()->getSettingValue<bool>("save-in-editor");
-
-        bool isModalActive = false;
-        if (auto* scene = CCDirector::get()->getRunningScene()) {
-            if (scene->getChildByType<FLAlertLayer>(0)) isModalActive = true;
-        }
-
-        if (inLevel || isModalActive || (inEditor && !saveInEditor)) {
-            if (!m_pendingSave) {
-                m_pendingSave      = true;
-                m_pendingTimestamp = std::chrono::steady_clock::now();
-
-                if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-                    log::info("[Better Saving] Save deferred: inLevel={} inEditor={} modal={}",
-                        inLevel, inEditor, isModalActive);
-
-                auto behavior = Mod::get()->getSettingValue<std::string>("defer-behavior");
-                if (behavior == "hud-icon" && inLevel) addPendingIcon();
-            }
-            return;
-        }
-
-        runSaveLogic();
-    }
-};
-
-static bool waitForFileReady(const std::filesystem::path& p, int maxRetries = 5) {
-    for (int i = 0; i < maxRetries; ++i) {
-        std::ifstream f(p, std::ios::binary);
-        if (f.is_open()) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    return false;
-}
-
-bool atomicCopy(
-    const std::filesystem::path& src,
-    const std::filesystem::path& dst,
-    std::error_code& ec
-) {
-    auto tmp = dst.string() + ".tmp." +
-        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-
-    if (!waitForFileReady(src)) {
-        ec = std::make_error_code(std::errc::resource_unavailable_try_again);
-        log::warn("[Better Saving] Source file locked after retries: {}", src.string());
-        return false;
-    }
-
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
-        if (!ec) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    if (ec) return false;
-
-    auto old = dst.string() + ".old";
-    if (std::filesystem::exists(dst, ec)) {
-        std::filesystem::rename(dst, old, ec);
-        if (ec) std::filesystem::remove(dst, ec);
-    }
-
-    ec = {};
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        std::filesystem::rename(tmp, dst, ec);
-        if (!ec) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    std::error_code cleanEc;
-    std::filesystem::remove(old, cleanEc);
-
-    return !ec;
-}
-
-void doRollingBackup() {
-    if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
-
-    std::error_code ec;
-    auto mainFile = geode::dirs::getSaveDir() / "CCGameManager.dat";
-    auto modDir = Mod::get()->getSaveDir();
-    std::filesystem::create_directories(modDir, ec);
-    auto b0 = modDir / "Save_Backup.bak";
-
-    if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
-        log::info("[Better Saving] Source: {}", mainFile.string());
-        log::info("[Better Saving] Dest:   {}", b0.string());
-    }
-
-    if (!std::filesystem::exists(mainFile, ec)) {
-        log::warn("[Better Saving] CCGameManager.dat NOT found in GD folder! Skipping.");
-        return;
-    }
-
-    bool ok = atomicCopy(mainFile, b0, ec);
-
-    if (!ok || ec) {
-        log::warn("[Better Saving] Backup failed: {} -> {}: {}", mainFile.string(), b0.string(), ec.message());
-        Notification::create("Backup failed!", NotificationIcon::Error)->show();
-    } else if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
-        log::info("[Better Saving] Regular backup created successfully.");
-    }
-}
-
-void doSafeExitBackup() {
-    if (!Mod::get()->getSettingValue<bool>("enable-backups")) return;
-
-    std::error_code ec;
-    auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
-    
-    auto modDir = Mod::get()->getSaveDir();
-    std::filesystem::create_directories(modDir, ec);
-    auto safeFile = modDir / "Last_Safe_Save_Backup.bak";
-
-    if (!std::filesystem::exists(mainFile, ec)) return;
-
-    bool ok = atomicCopy(mainFile, safeFile, ec);
-
-    if (!ok || ec) {
-        log::warn("[Better Saving] Safe exit backup failed: {} -> {}: {}", mainFile.string(), safeFile.string(), ec.message());
-        Notification::create("Safe exit backup failed!", NotificationIcon::Error)->show();
-    } else if (Mod::get()->getSettingValue<bool>("verbose-logging")) {
-        log::info("[Better Saving] Safe exit backup created.");
-    }
-}
-
-bool restoreFromBackup(const std::string& backupName) {
-    std::error_code ec;
-    auto backupFile = Mod::get()->getSaveDir() / backupName;
-auto mainFile   = geode::dirs::getSaveDir() / "CCGameManager.dat"; 
-
-    if (!std::filesystem::exists(backupFile, ec)) {
-        Notification::create("Backup not found!", NotificationIcon::Error)->show();
-        return false;
-    }
-
-    AutoSaveManager::get()->stopTimer();
-    AutoSaveManager::get()->removePendingIcon();
-
-    atomicCopy(backupFile, mainFile, ec);
-
-    if (ec) {
-        log::error("[Better Saving] Restore failed: {}", ec.message());
-        AutoSaveManager::get()->scheduleTimer();
-        Notification::create("Restore failed!", NotificationIcon::Error)->show();
-        return false;
-    }
-
-    geode::utils::game::restart(false);
-    return true;
-}
-
-void runSaveLogic(bool force) {
-    auto now = std::chrono::steady_clock::now();
-    auto* manager = AutoSaveManager::get();
-
-    auto cooldownSecs = Mod::get()->getSettingValue<int64_t>("save-cooldown");
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        now - manager->m_lastSaveTimestamp
-    ).count();
-
-    if (!force && elapsed < cooldownSecs) {
-        if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[Better Saving] Save skipped أ¢â‚¬â€‌ cooldown ({}/{}s).",
-                (long long)elapsed, (long long)cooldownSecs);
-
-if (Mod::get()->getSettingValue<bool>("show-notification")) {
-            auto last = Mod::get()->getSavedValue<int64_t>("last-save-time", 0);
-            if (last > 0) {
-                std::ostringstream ss;
-                ss << "Already saved at " << fmtLastSaveTime(last);
-                Notification::create(ss.str().c_str(), NotificationIcon::Warning)->show();
-            } else {
-                Notification::create("Already saved recently", NotificationIcon::Warning)->show();
-            }
-        }
-        return;
-    }
-
-    auto* gm = GameManager::get();
-    if (!gm) return;
-
-    bool expected = false;
-    if (!s_saving.compare_exchange_strong(expected, true)) return;
-    SavingGuard guard;
-
-    try {
-        gm->save();
-    } catch (...) {
-        log::error("[Better Saving] Exception thrown during save!");
-        return;
-    }
-    
-    doRollingBackup(); 
-
-    manager->m_lastSaveTimestamp = now;
-    manager->m_pendingSave       = false;
-    manager->removePendingIcon();
-
-    Mod::get()->setSavedValue<int64_t>(
-        "last-save-time",
-        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())
-    );
-Mod::get()->saveData();
-
-    if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-        log::info("[Better Saving] Save executed successfully.");
-    if (Mod::get()->getSettingValue<bool>("show-notification"))
-        Notification::create("Game saved!", NotificationIcon::Success)->show();
-}
-
 $execute {
     (void)Mod::get()->registerCustomSettingType("force-save-button", &ForceSaveSettingV3::parse);
     (void)Mod::get()->registerCustomSettingType("backup-manager",    &BackupManagerSettingV3::parse);
@@ -841,13 +958,13 @@ $execute {
     if (Mod::get()->getSettingValue<bool>("enabled"))
         AutoSaveManager::get()->scheduleTimer();
 
-    listenForSettingChanges<bool>("enabled", [](bool value) {
+    listenForSettingChanges<bool>("enabled",[](bool value) {
         if (value) AutoSaveManager::get()->scheduleTimer();
         else       AutoSaveManager::get()->stopTimer();
         Mod::get()->saveData();
     });
 
-    listenForSettingChanges<int64_t>("save-interval", [](int64_t) {
+    listenForSettingChanges<int64_t>("save-interval",[](int64_t) {
         if (Mod::get()->getSettingValue<bool>("enabled")) {
             AutoSaveManager::get()->stopTimer();
             AutoSaveManager::get()->scheduleTimer();
@@ -855,7 +972,7 @@ $execute {
         Mod::get()->saveData();
     });
 
-    listenForSettingChanges<bool>("auto-save-enabled", [](bool value) {
+    listenForSettingChanges<bool>("auto-save-enabled",[](bool value) {
         if (Mod::get()->getSettingValue<bool>("enabled")) {
             if (value) AutoSaveManager::get()->scheduleTimer();
             else       AutoSaveManager::get()->stopTimer();
@@ -870,29 +987,21 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         if (this->m_isPracticeMode) {
             if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-                log::info("[Better Saving] Practice mode أ¢â‚¬â€‌ skipping save.");
+                log::info("[Better Saving] Practice mode — skipping save.");
             return;
         }
 
         if (!Mod::get()->getSettingValue<bool>("enabled")) return;
         if (!Mod::get()->getSettingValue<bool>("save-on-complete")) return;
 
-        auto sequence = CCSequence::create(
-            CCDelayTime::create(5.0f),
-            CCCallFunc::create(this, callfunc_selector(MyPlayLayer::triggerDelayedSave)),
-            nullptr
-        );
-        this->runAction(sequence);
-    }
-
-    void triggerDelayedSave() {
+        // Delegate the delay entirely to the AutoSaveManager!
+        // This ensures the save triggers even if the user exits PlayLayer before 5 seconds passes.
         auto* manager = AutoSaveManager::get();
-        manager->m_pendingSave = false;
-        manager->removePendingIcon();
-        runSaveLogic(true);
+        manager->m_levelCompletePending = true;
+        manager->m_levelCompleteTimer = 5.0f;
 
         if (Mod::get()->getSettingValue<bool>("verbose-logging"))
-            log::info("[Better Saving] Level complete save triggered.");
+            log::info("[Better Saving] Level complete detected. Triggering save in 5 seconds...");
     }
 };
 
@@ -924,9 +1033,9 @@ class $modify(MyMenuLayer, MenuLayer) {
         );
         exitSpr->setScale(0.8f);
 
+        // Native exit route! Connect directly to the game's default onQuit function.
         auto* exitBtn = CCMenuItemSpriteExtra::create(
-            exitSpr, this,
-            menu_selector(MyMenuLayer::onMobileExit)
+            exitSpr, this, menu_selector(MenuLayer::onQuit)
         );
 
         auto* exitMenu = CCMenu::create();
@@ -937,27 +1046,16 @@ class $modify(MyMenuLayer, MenuLayer) {
 
         return true;
     }
+};
 
-#if defined(GEODE_IS_ANDROID) || defined(GEODE_IS_IOS)
-    void onMobileExit(CCObject*) {
-        createQuickPopup(
-            "Exit Game",
-            "<cy>This button saves and exits the game.</c>",
-            "Cancel", "Exit",
-            [](auto*, bool ok) {
-                if (!ok) return;
-                doSafeExitBackup();
-                runSaveLogic(true);
-                Mod::get()->saveData();
-                CCDirector::get()->end();
-            }
-        );
-    }
-#endif
-
-    void onQuit(CCObject* sender) {
-        doSafeExitBackup();
-        MenuLayer::onQuit(sender);
+// Crucial: Run Safe Exit Backup at the deepest level right before the app shuts down.
+// This handles any form of Exit (including the PC Quit button or Mobile Quit).
+class $modify(MyDirector, CCDirector) {
+    void end() {
+        if (Mod::get()->getSettingValue<bool>("enabled")) {
+            doSafeExitBackupSync();
+        }
+        CCDirector::end();
     }
 };
 
